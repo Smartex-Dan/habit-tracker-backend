@@ -1,21 +1,27 @@
 """
 Builds a Supabase client scoped to the requesting user's access token.
 
-We always use the SUPABASE_ANON_KEY (never the service role key) here.
+We always use the SUPABASE_ANON_KEY (never the service role key) here, and
+then attach the user's own JWT so requests through BOTH sub-clients Django
+actually uses are properly authenticated:
 
-Previous approach (client.postgrest.auth(token) + manually poking
-client.storage._client.headers) only reliably authenticated the
-postgrest sub-client — the private-attribute path for storage isn't a
-stable public API and didn't propagate the token to actual outgoing
-Storage requests, which is why avatar uploads kept failing RLS with a
-403 even after "setting" the header.
+  - postgrest (database queries — habits, check_ins, etc.)
+  - storage   (Storage bucket uploads — avatars)
 
-Fixed approach: pass the Authorization header via ClientOptions at
-client-CREATION time instead. supabase-py threads these global headers
-into every sub-client it builds (postgrest, storage, auth) uniformly,
-since they all share the same base request configuration — this is the
-documented way to scope a whole client to a user's JWT, rather than
-patching individual sub-clients after construction.
+This was verified against the actual installed supabase-py==2.31.0 source
+(_sync/client.py), not guessed:
+
+  - `client.postgrest` and `client.storage` are BOTH lazily built on first
+    access, and BOTH read from `self.options.headers` at that moment.
+  - `client.postgrest.auth(token)` is a method on the already-constructed
+    postgrest sub-client that patches its own session directly — this is
+    why postgrest already worked without touching `options.headers`.
+  - `storage` has no equivalent `.auth()` method. It only ever picks up
+    whatever is in `client.options.headers["Authorization"]` at the moment
+    it's first accessed. Since a fresh client is built per-request here
+    and `.storage` hasn't been touched yet, setting `options.headers`
+    below is picked up correctly the first time any view accesses
+    `client.storage`.
 
 Every query/upload made through this client is subject to Row Level
 Security exactly as if the frontend had called Supabase directly —
@@ -24,7 +30,6 @@ Django never gets a "god mode" bypass on the database or storage.
 
 from django.conf import settings
 from supabase import create_client, Client
-from supabase.lib.client_options import ClientOptions
 
 
 def get_supabase_client_for_request(request) -> Client:
@@ -36,16 +41,15 @@ def get_supabase_client_for_request(request) -> Client:
     """
     access_token = getattr(request, "supabase_access_token", None)
 
-    options = ClientOptions(
-        headers={"Authorization": f"Bearer {access_token}"} if access_token else {}
-    )
-
-    client = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY, options=options)
+    client = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
 
     if access_token:
-        # Kept alongside the ClientOptions header for postgrest specifically —
-        # this call was already working correctly before, so it stays as a
-        # belt-and-suspenders safeguard rather than being ripped out.
+        # Postgrest: unchanged, already-working path.
         client.postgrest.auth(access_token)
+
+        # Storage: must be set on options.headers BEFORE `.storage` is
+        # first accessed anywhere in the request, since that's when it
+        # lazily builds its client and reads this dict.
+        client.options.headers["Authorization"] = f"Bearer {access_token}"
 
     return client
