@@ -7,6 +7,7 @@ own JWT — Supabase Storage policies enforce that a user can only write to
 their own path, the same way Postgres RLS does for habits/check_ins.
 """
 
+import traceback
 import uuid
 
 from rest_framework import status
@@ -16,9 +17,9 @@ from rest_framework.views import APIView
 
 from habits.supabase_client import get_supabase_client_for_request
 
-AVATAR_BUCKET = "avatars"
+AVATAR_BUCKET = "avatar"
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
-MAX_AVATAR_SIZE_BYTES = 7 * 1024 * 1024  # MB
+MAX_AVATAR_SIZE_BYTES = 7 * 1024 * 1024  # 7 MB
 
 
 class AvatarUploadView(APIView):
@@ -38,6 +39,11 @@ class AvatarUploadView(APIView):
          authenticated users to INSERT/UPDATE objects where the path
          starts with their own auth.uid() — mirrors the RLS pattern
          already used on the habits/check_ins tables.
+
+    TEMPORARY DEBUG WRAP: the upload step is wrapped in try/except so that
+    if the bucket/policy setup above isn't done yet, you get the real
+    Supabase error back in the response instead of a bare 500. Revert to
+    letting it raise naturally once confirmed working.
     """
 
     parser_classes = [MultiPartParser]
@@ -61,4 +67,36 @@ class AvatarUploadView(APIView):
             return Response(
                 {"detail": "File too large. Max size is 7MB."},
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            supabase = get_supabase_client_for_request(request)
+
+            file_ext = file_obj.name.rsplit(".", 1)[-1] if "." in file_obj.name else "jpg"
+            # Scoped under the user's own id so Storage RLS policies (path
+            # starts with auth.uid()) can enforce ownership, same pattern
+            # as habits/check_ins rows being scoped by user_id.
+            storage_path = f"{request.user.id}/{uuid.uuid4()}.{file_ext}"
+
+            file_bytes = file_obj.read()
+
+            supabase.storage.from_(AVATAR_BUCKET).upload(
+                storage_path,
+                file_bytes,
+                {"content-type": file_obj.content_type, "upsert": "true"},
+            )
+
+            public_url = supabase.storage.from_(AVATAR_BUCKET).get_public_url(storage_path)
+
+            return Response({"avatar_url": public_url}, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response(
+                {
+                    "detail": "DEBUG ERROR — remove this except block once fixed",
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
