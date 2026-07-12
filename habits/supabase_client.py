@@ -1,17 +1,21 @@
 """
 Builds a Supabase client scoped to the requesting user's access token.
 
-We always use the SUPABASE_ANON_KEY (never the service role key) here, and
-then attach the user's own JWT to BOTH sub-clients Django actually uses:
+We always use the SUPABASE_ANON_KEY (never the service role key) here.
 
-  - postgrest (the Postgres/database queries — habits, check_ins, etc.)
-  - storage   (Storage bucket uploads — avatars)
+Previous approach (client.postgrest.auth(token) + manually poking
+client.storage._client.headers) only reliably authenticated the
+postgrest sub-client — the private-attribute path for storage isn't a
+stable public API and didn't propagate the token to actual outgoing
+Storage requests, which is why avatar uploads kept failing RLS with a
+403 even after "setting" the header.
 
-Each is a genuinely separate underlying HTTP client in supabase-py, so
-authenticating one does NOT automatically authenticate the other — this
-was the source of a 403 "row violates row-level security policy" on
-avatar uploads even though database queries worked fine, since only
-postgrest was being scoped to the user's JWT before.
+Fixed approach: pass the Authorization header via ClientOptions at
+client-CREATION time instead. supabase-py threads these global headers
+into every sub-client it builds (postgrest, storage, auth) uniformly,
+since they all share the same base request configuration — this is the
+documented way to scope a whole client to a user's JWT, rather than
+patching individual sub-clients after construction.
 
 Every query/upload made through this client is subject to Row Level
 Security exactly as if the frontend had called Supabase directly —
@@ -20,6 +24,7 @@ Django never gets a "god mode" bypass on the database or storage.
 
 from django.conf import settings
 from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions
 
 
 def get_supabase_client_for_request(request) -> Client:
@@ -31,17 +36,16 @@ def get_supabase_client_for_request(request) -> Client:
     """
     access_token = getattr(request, "supabase_access_token", None)
 
-    client = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
+    options = ClientOptions(
+        headers={"Authorization": f"Bearer {access_token}"} if access_token else {}
+    )
+
+    client = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY, options=options)
 
     if access_token:
-        # Scope PostgREST requests to this user so RLS policies
-        # (auth.uid() = user_id, etc.) apply correctly.
+        # Kept alongside the ClientOptions header for postgrest specifically —
+        # this call was already working correctly before, so it stays as a
+        # belt-and-suspenders safeguard rather than being ripped out.
         client.postgrest.auth(access_token)
-
-        # Storage is a separate sub-client with its own HTTP session —
-        # postgrest.auth() above does NOT cover it. Without this, every
-        # Storage request goes out as the anon key with no user identity,
-        # so any RLS policy checking auth.uid() on storage.objects fails.
-        client.storage._client.headers["Authorization"] = f"Bearer {access_token}"
 
     return client
