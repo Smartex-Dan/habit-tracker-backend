@@ -13,14 +13,10 @@ from rest_framework import serializers
 class HabitCreateSerializer(serializers.Serializer):
     """Validates the body of POST /api/habits."""
 
-    title = serializers.CharField(max_length=255)
-    description = serializers.CharField(
-        max_length=1000, required=False, allow_blank=True, allow_null=True
-    )
-    color = serializers.RegexField(
-        regex=r"^#(?:[0-9a-fA-F]{3}){1,2}$",
-        error_messages={"invalid": "color must be a valid hex code, e.g. #8B6F4E"},
-    )
+    title = serializers.CharField(max_length=200)
+    description = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    color = serializers.CharField(max_length=20)
+    reminder_time = serializers.TimeField(required=False, allow_null=True)
 
 
 class HabitSerializer(serializers.Serializer):
